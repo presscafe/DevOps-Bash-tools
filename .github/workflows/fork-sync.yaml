@@ -1,0 +1,153 @@
+#
+#  Author: Hari Sekhon
+#  Date: Tue Feb 4 09:53:28 2020 +0000
+#
+#  vim:ts=2:sts=2:sw=2:et
+#
+#  https://github.com/HariSekhon/DevOps-Bash-tools
+#
+#  If you're using my code you're welcome to connect with me on LinkedIn and optionally send me feedback
+#
+#  https://www.linkedin.com/in/HariSekhon
+#
+
+# ============================================================================ #
+#                               F o r k   S y n c
+# ============================================================================ #
+
+# For a fork of the original repo, activate to keep it up to date via straight GitHub sync to the default branch
+#
+# This is a fork-local implementation of HariSekhon/GitHub-Actions/.github/workflows/fork-sync.yaml
+# because that reusable workflow hardcodes GH_TOKEN to the built-in Actions GITHUB_TOKEN, which can never be
+# granted the `workflow` scope / `workflows` permission required to write .github/workflows/* files, so it
+# fails whenever the upstream commits touch any workflow files, eg:
+#
+#   Upstream commits contain workflow changes, which require the `workflow` scope or permission to merge.
+#
+#   GraphQL: refusing to allow a GitHub App to create or update workflow `.github/workflows/x.yaml` without `workflows` permission
+#
+# The GITHUB_TOKEN cannot be granted that permission (not even via `permissions: workflows: write`) because it is
+# a GitHub App installation token, not a user token with the OAuth `workflow` scope.
+#
+# So instead of relying on it:
+#
+#   1. a straight fast-forward is attempted first, which needs no special permission and is all that is
+#      required for the vast majority of upstream commits
+#
+#   2. if that fails, eg. because the upstream commits touch .github/workflows/* (or because this fork has
+#      local commits of its own), a git merge is done using the optional SYNC_TOKEN secret, which must be a
+#      token that has the `workflow` scope / `workflows` permission:
+#
+#        gh secret set SYNC_TOKEN --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+#
+#      ie. a fine-grained PAT with Contents and Workflows read/write access to this repo,
+#      or a classic PAT with the `repo` and `workflow` scopes
+#
+# This merges rather than hard resets so that fork-local commits - such as this workflow file - are preserved
+# and are not silently wiped out by the next sync
+#
+# Without the SYNC_TOKEN secret the sync still works for all upstream commits that don't touch workflow files,
+# and the job fails with an actionable error message when it hits the case that requires it
+
+---
+name: Fork Sync
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 */3 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GH_NO_UPDATE_NOTIFIER: 1
+  DEBUG: ${{ github.event.inputs.debug == 'true' || '' }}
+
+jobs:
+  sync:
+    # github.event.repository context not available in scheduled workflows
+    #if: github.event.repository.fork == true
+    if: github.repository_owner != 'HariSekhon'
+    name: Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync Fork
+        env:
+          # GH_TOKEN only falls back to the built-in token, which cannot merge upstream commits touching
+          # .github/workflows/* - see the notes at the top of this file
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${DEBUG:-}" ] && set -x
+
+          branch="$(gh api "/repos/$GITHUB_REPOSITORY" -q .default_branch)"
+          upstream="$(gh api "/repos/$GITHUB_REPOSITORY" -q .parent.full_name)"
+
+          if [ -z "$upstream" ] || [ "$upstream" = null ]; then
+              echo "$GITHUB_REPOSITORY is not a fork, nothing to sync"
+              exit 0
+          fi
+
+          echo "Syncing $GITHUB_REPOSITORY:$branch from $upstream:$branch"
+
+          # Cheap check so that forks carrying local commits don't clone and merge upstream every run for nothing:
+          #   identical = up to date, behind = this fork has local commits but upstream has nothing new to pull
+          status="$(gh api "/repos/$GITHUB_REPOSITORY/compare/$upstream:$branch...$branch" -q .status 2>/dev/null || :)"
+          if [ "$status" = identical ] || [ "$status" = behind ]; then
+              echo 'Already up to date'
+              exit 0
+          fi
+
+          # Fast forward. This is all that is needed for upstream commits that don't touch workflow files
+          if output="$(gh repo sync "$GITHUB_REPOSITORY" --source "$upstream" --branch "$branch" 2>&1)"; then
+              printf '%s\n' "$output"
+              exit 0
+          fi
+          printf '%s\n' "$output"
+
+          if [ -z "$SYNC_TOKEN" ]; then
+              if grep -qi workflow <<< "$output"; then
+                  echo "::error::Upstream commits touch .github/workflows/, which the built-in Actions GITHUB_TOKEN can never write because the 'workflows' permission cannot be granted to it. Add a token that has it as the SYNC_TOKEN secret in this repo - a fine-grained PAT with Contents and Workflows read/write access, or a classic PAT with the repo and workflow scopes - or use 'Sync fork' in the GitHub UI instead. See the notes at the top of .github/workflows/fork-sync.yaml"
+              elif grep -qiE 'diverging|fast.forward' <<< "$output"; then
+                  echo "::error::This fork carries local commits (such as .github/workflows/fork-sync.yaml) that upstream doesn't have, so upstream can no longer be fast-forwarded into it. Add a token as the SYNC_TOKEN secret in this repo - a fine-grained PAT with Contents and Workflows read/write access, or a classic PAT with the repo and workflow scopes - so that the sync can merge upstream in. See the notes at the top of .github/workflows/fork-sync.yaml"
+              fi
+              exit 1
+          fi
+
+          # Merge, so that fork-local commits (such as this workflow file) are preserved rather than hard reset,
+          # and so that upstream commits touching .github/workflows/* can be brought in via the PAT's workflow scope
+          echo 'Falling back to git merge using the SYNC_TOKEN secret...'
+
+          git clone --quiet "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" fork
+          cd fork
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${upstream}.git"
+          git fetch --quiet upstream "$branch"
+
+          if ! git merge --no-edit "upstream/$branch"; then
+              echo 'Conflicts with upstream:'
+              git diff --name-only --diff-filter=U || :
+              echo 'Retrying, resolving conflicts in favour of this fork...'
+              git merge --abort || :
+              git merge --no-edit -X ours "upstream/$branch"
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse "upstream/$branch")" ]; then
+              echo 'Already up to date'
+              exit 0
+          fi
+
+          git push --quiet origin "HEAD:$branch"
+          echo "Successfully synced $upstream:$branch into $GITHUB_REPOSITORY:$branch"
